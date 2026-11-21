@@ -15,6 +15,12 @@ npm run dev        # http://localhost:5173, reloads on save
 npm run build      # rebuilds dist/index.html
 ```
 
+## Deploy on Vercel
+
+`vercel.json` and `.vercelignore` in the repo root are set up for this. Import the repo on Vercel and keep the project root at the repo root; no settings need changing. Vercel runs `npm ci` and `npm run build` in `frontend/` and serves `frontend/dist/`. Data, model weights and the Python code are not uploaded. Needs Node 20.19 or newer (Vercel's default is fine).
+
+From a terminal instead: `npx vercel` (preview) or `npx vercel --prod`, run from the repo root.
+
 ## The three scenarios
 
 All three are from 2021–2024, the years M1 never saw in training.

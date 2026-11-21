@@ -1,0 +1,19 @@
+# Vercel only builds the dashboard in frontend/. Keep the upload small:
+# the datasets, model weights and Python pipeline are not needed at build time.
+# Patterns start with "/" so they match only at the repo root
+# (frontend/src/data/ holds the exported results the dashboard needs).
+/data/
+/models/
+/notebooks/
+/scripts/
+/solarshield/
+/tests/
+/user-simulation-tests/
+/.venv/
+/alert_engine.py
+/requirements.txt
+/pytest.ini
+/plan.md
+/frontend/node_modules/
+__pycache__/
+*.pyc
