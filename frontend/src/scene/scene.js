@@ -1,5 +1,9 @@
 // The semi-3D engine: Earth, magnetosphere, solar wind, CME, Aditya-L1, NavIC + GPS satellites,
-// signal paths to Indian sites, and a scripted camera that the presenter can nudge.
+// alert sites over India, and a camera that follows the timeline (the presenter can nudge it).
+//
+// The magnetopause is not drawn as a surface: solar-wind particles show it by piling up and
+// sliding around it. Some get caught on the field lines and spiral down into funnels at the poles.
+// Everything that moves runs on the story clock (st.dh): pause the timeline and the scene stops.
 //
 // Units: 1 scene unit = 1 Earth radius (Re). The Sun is far to the left (-x). Not to scale
 // outside the magnetosphere: L1 and the Sun are pulled in so they fit on screen.
@@ -28,6 +32,7 @@ const L1_X = -30;
 const GEO_R = 6.62;
 const GPS_R = 4.16;
 const INDIA = { lat: 22, lon: 80 };
+const EARTH_R = 1.35; // globe drawn larger than 1 Re so India reads at every zoom
 
 const fresnelVert = /* glsl */ `
   varying vec3 vN; varying vec3 vV;
@@ -72,7 +77,6 @@ export class StormScene {
     this.scene.background = COL.bg;
     this.camera = new THREE.PerspectiveCamera(38, 1, 0.05, 2000);
     this.camera.position.set(-16, 9, 46);
-    this.camTarget = new THREE.Vector3(-15, 0, 0);
 
 
     this.time = 0;
@@ -88,7 +92,6 @@ export class StormScene {
     this.buildL1();
     this.buildSatellites();
     this.buildSites();
-    this.buildRays();
     this.bindPointer();
     this.resize();
   }
@@ -127,6 +130,9 @@ export class StormScene {
   buildEarth() {
     this.earth = new THREE.Group();
     this.scene.add(this.earth);
+    this.globe = new THREE.Group();
+    this.globe.scale.setScalar(EARTH_R);
+    this.earth.add(this.globe);
 
     // Ocean: blue, lit on the day side
     const occ = new THREE.Mesh(
@@ -138,7 +144,7 @@ export class StormScene {
           void main(){ float d = smoothstep(-0.12, 0.35, dot(vN, uSun)); gl_FragColor = vec4(mix(uNight, uDay, d), 1.0); }`,
       })
     );
-    this.earth.add(occ);
+    this.globe.add(occ);
 
     const all = [...landData.land.map((p) => [...p, 0]), ...landData.india.map((p) => [...p, 1])];
     const pos = new Float32Array(all.length * 3);
@@ -169,7 +175,7 @@ export class StormScene {
           vDay = smoothstep(-0.12, 0.3, dot(n, uSun));
           vIndia = aIndia;
           vec4 mv = modelViewMatrix * vec4(position,1.0);
-          float s = mix(0.034, 0.0115, aIndia);
+          float s = mix(0.034, 0.0115, aIndia) * ${EARTH_R.toFixed(2)};
           gl_PointSize = clamp(s * uPR * 900.0 / -mv.z, mix(1.0, 1.6, aIndia), 9.0);
           gl_Position = projectionMatrix * mv;
         }`,
@@ -183,7 +189,7 @@ export class StormScene {
           gl_FragColor = vec4(col, 1.0);
         }`,
     });
-    this.earth.add(new THREE.Points(g, this.dotMat));
+    this.globe.add(new THREE.Points(g, this.dotMat));
 
     // India outline
     for (const ring of landData.india_outline) {
@@ -192,7 +198,7 @@ export class StormScene {
         new THREE.BufferGeometry().setFromPoints(pts),
         new THREE.LineBasicMaterial({ color: COL.india, transparent: true, opacity: 0.55 })
       );
-      this.earth.add(line);
+      this.globe.add(line);
     }
 
     // Ionosphere: brightens in the equatorial anomaly bands on the night side as the storm grows
@@ -236,10 +242,10 @@ export class StormScene {
       depthWrite: false,
       blending: THREE.AdditiveBlending,
     });
-    this.earth.add(new THREE.Mesh(new THREE.SphereGeometry(1.045, 96, 64), this.ionoMat));
+    this.globe.add(new THREE.Mesh(new THREE.SphereGeometry(1.045, 96, 64), this.ionoMat));
 
     // Thin atmosphere rim (not rotating with Earth matters little: it's a sphere)
-    this.scene.add(new THREE.Mesh(new THREE.SphereGeometry(1.09, 64, 48), fresnelMaterial(new THREE.Color("#4f8dff"), 0.3, 0, 3.5, THREE.BackSide)));
+    this.scene.add(new THREE.Mesh(new THREE.SphereGeometry(1.09 * EARTH_R, 64, 48), fresnelMaterial(new THREE.Color("#4f8dff"), 0.3, 0, 3.5, THREE.BackSide)));
   }
 
   buildField() {
@@ -282,6 +288,7 @@ export class StormScene {
     };
     this.shieldGrid = { NT, NP };
     this.magnetopause = make(fresnelMaterial(COL.shield, 0.14, 0.0, 3.0));
+    this.magnetopause.visible = false; // shown by the particles instead
     this.bowShock = make(fresnelMaterial(new THREE.Color("#808080"), 0.0, 0.0, 3.2));
     this.bowShock.visible = false;
   }
@@ -304,44 +311,270 @@ export class StormScene {
     mesh.geometry.computeVertexNormals();
   }
 
+  // ---------- solar wind ----------
+  // A pool of particles released from the Sun in batches (puffs). Each particle is idle,
+  // flowing with the wind, or caught on a field line and spiralling into a polar funnel.
   buildWind() {
-    const n = 900;
-    this.wind = { n, p: new Float32Array(n * 3), v: new Float32Array(n * 3), r: new Float32Array(n) };
-    for (let i = 0; i < n; i++) this.spawn(i, true);
+    const n = 16000;
+    this.wind = {
+      n,
+      p: new Float32Array(n * 3),
+      v: new Float32Array(n * 3),
+      r: new Float32Array(n),
+      mode: new Uint8Array(n), // 0 idle, 1 flowing, 2 caught on a field line
+      cap: new Float32Array(n * 8), // L, psi, hemi, s, speed, phase, u0, uEnd
+      cp: new Float32Array(n * 3), // where it was caught
+      next: 0,
+      clock: 0,
+    };
+    for (let i = 0; i < n; i++) {
+      this.wind.r[i] = Math.random();
+      this.park(i);
+    }
     const g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.BufferAttribute(this.wind.p, 3));
     g.setAttribute("color", new THREE.BufferAttribute(new Float32Array(n * 3), 3));
-    this.windPts = new THREE.Points(
-      g,
-      new THREE.ShaderMaterial({
-        uniforms: { uPR: { value: this.renderer.getPixelRatio() } },
-        vertexShader: /* glsl */ `
-          attribute vec3 color; varying vec3 vC; uniform float uPR;
-          void main(){ vC = color; vec4 mv = modelViewMatrix * vec4(position,1.0);
-            gl_PointSize = clamp(uPR * 110.0 / -mv.z, 1.5, 3.5); gl_Position = projectionMatrix * mv; }`,
-        fragmentShader: /* glsl */ `
-          varying vec3 vC; void main(){ vec2 c = gl_PointCoord - 0.5; float d = dot(c,c); if (d > 0.25) discard;
-            gl_FragColor = vec4(vC * (1.0 - d * 3.0), 1.0); }`,
-        transparent: true,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-      })
-    );
+    g.setAttribute("aSize", new THREE.BufferAttribute(new Float32Array(n), 1));
+    this.windMat = new THREE.ShaderMaterial({
+      uniforms: { uPR: { value: this.renderer.getPixelRatio() }, uBoost: { value: 0 } },
+      vertexShader: /* glsl */ `
+        attribute vec3 color; attribute float aSize; varying vec3 vC; uniform float uPR; uniform float uBoost;
+        void main(){ vC = color; vec4 mv = modelViewMatrix * vec4(position,1.0);
+          gl_PointSize = clamp(uPR * aSize * 130.0 * (1.0 + 0.5 * uBoost) / -mv.z, 1.5, 4.0 + 3.0 * uBoost); gl_Position = projectionMatrix * mv; }`,
+      fragmentShader: /* glsl */ `
+        varying vec3 vC; void main(){ vec2 c = gl_PointCoord - 0.5; float d = dot(c,c); if (d > 0.25) discard;
+          gl_FragColor = vec4(vC * (1.0 - d * 3.0), 1.0); }`,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    this.windPts = new THREE.Points(g, this.windMat);
     this.windPts.frustumCulled = false;
     this.scene.add(this.windPts);
   }
 
-  spawn(i, anywhere = false) {
-    const { p, v, r } = this.wind;
-    const a = Math.random() * Math.PI * 2;
-    const rad = Math.sqrt(Math.random()) * 17 + 0.15;
-    p[i * 3] = anywhere ? -46 + Math.random() * 80 : -46 - Math.random() * 2;
-    p[i * 3 + 1] = Math.cos(a) * rad;
-    p[i * 3 + 2] = Math.sin(a) * rad;
-    v[i * 3] = 1;
-    v[i * 3 + 1] = 0;
-    v[i * 3 + 2] = 0;
-    r[i] = Math.random();
+  park(i) {
+    const W = this.wind;
+    W.mode[i] = 0;
+    W.p[i * 3] = 0;
+    W.p[i * 3 + 1] = 1e5;
+    W.p[i * 3 + 2] = 0;
+  }
+
+  // One batch: a few puffs of particles leaving the Sun together.
+  releaseBatch(size, aim) {
+    const W = this.wind;
+    const g = () => Math.random() + Math.random() + Math.random() - 1.5;
+    const puffs = 1 + Math.floor(Math.random() * 3);
+    let tries = 0;
+    for (let k = 0; k < puffs; k++) {
+      const a = Math.random() * Math.PI * 2;
+      const rad = Math.sqrt(Math.random()) * aim;
+      const cy = Math.cos(a) * rad;
+      const cz = Math.sin(a) * rad;
+      const spread = 1.2 + Math.random() * 1.6;
+      let placed = 0;
+      while (placed < size / puffs && tries < W.n) {
+        const i = W.next;
+        W.next = (W.next + 1) % W.n;
+        tries++;
+        if (W.mode[i]) continue;
+        W.p[i * 3] = -47 + g() * spread * 2;
+        W.p[i * 3 + 1] = cy + g() * spread;
+        W.p[i * 3 + 2] = cz + g() * spread;
+        W.v[i * 3] = 1;
+        W.v[i * 3 + 1] = 0;
+        W.v[i * 3 + 2] = 0;
+        W.mode[i] = 1;
+        placed++;
+      }
+    }
+  }
+
+  // Hand a particle that hit the magnetopause over to the field line through that point.
+  capture(i, r0, alpha) {
+    const W = this.wind;
+    const x = W.p[i * 3];
+    const y = W.p[i * 3 + 1];
+    const z = W.p[i * 3 + 2];
+    const L = clamp(Math.hypot(x, y, z) * (0.85 + 0.25 * Math.random()), 3, 12);
+    const hemi = Math.abs(y) < 0.4 ? (Math.random() < 0.5 ? 1 : -1) : Math.sign(y);
+    const thMin = Math.asin(Math.sqrt(1 / L));
+    const span = Math.PI - 2 * thMin;
+    const uFoot = (Math.asin(Math.sqrt(Math.min(1, (EARTH_R * 1.02) / L))) - thMin) / span;
+    const c = W.cap;
+    c[i * 8] = L;
+    c[i * 8 + 1] = Math.atan2(z, x);
+    c[i * 8 + 2] = hemi;
+    c[i * 8 + 3] = 0;
+    c[i * 8 + 4] = 0.3 + 0.35 * Math.random();
+    c[i * 8 + 5] = Math.random() * Math.PI * 2;
+    c[i * 8 + 6] = 0.5 - hemi * 0.04;
+    c[i * 8 + 7] = hemi > 0 ? uFoot : 1 - uFoot;
+    W.cp[i * 3] = x;
+    W.cp[i * 3 + 1] = y;
+    W.cp[i * 3 + 2] = z;
+    W.mode[i] = 2;
+  }
+
+  // How hard the Sun is pushing: quiet wind ~0, a big storm ~1.
+  windIntensity(st) {
+    const o = st.obs;
+    return clamp(Math.max(st.storm * 1.25, (o.dyn_pressure - 2) / 18, (o.sw_speed - 400) / 450));
+  }
+
+  stepWind(st, r0, alpha, dt, inten) {
+    const W = this.wind;
+    const { n, p, v, cap } = W;
+    const o = st.obs;
+    // batches: more often and bigger as the storm grows
+    W.clock += dt;
+    const every = lerp(0.7, 0.1, inten);
+    while (W.clock >= every) {
+      W.clock -= every;
+      this.releaseBatch(Math.round(lerp(70, 480, inten) * (0.6 + 0.8 * Math.random())), lerp(15, 10, inten));
+    }
+    const frontX = this.cmeX ?? -100;
+    const preImpact = st.h < st.impactH;
+    const ambSpeed = (o.sw_speed / 400) * 7;
+    const capRate = 0.25 + 3.5 * inten; // per second spent against the magnetopause
+    const tmp = this._t1 ?? (this._t1 = new THREE.Vector3());
+    const nrm = this._t2 ?? (this._t2 = new THREE.Vector3());
+    const A = this._t3 ?? (this._t3 = new THREE.Vector3());
+    const B = this._t4 ?? (this._t4 = new THREE.Vector3());
+    const e1 = this._t5 ?? (this._t5 = new THREE.Vector3());
+    const e2 = this._t6 ?? (this._t6 = new THREE.Vector3());
+    for (let i = 0; i < n; i++) {
+      const m = W.mode[i];
+      if (m === 0) continue;
+      const ix = i * 3;
+      if (m === 2) {
+        // caught: spiral along the field line down into the polar funnel
+        const c = i * 8;
+        let sP = cap[c + 3] + dt * cap[c + 4] * (0.5 + 1.5 * cap[c + 3]);
+        if (sP >= 1) {
+          this.park(i);
+          continue;
+        }
+        cap[c + 3] = sP;
+        const L = cap[c];
+        const psi = cap[c + 1];
+        const u = lerp(cap[c + 6], cap[c + 7], sP);
+        const du = (cap[c + 7] - cap[c + 6]) * 0.01;
+        this.fieldPoint(psi, L, u, r0, alpha, st.storm, A);
+        this.fieldPoint(psi, L, u + du, r0, alpha, st.storm, B);
+        B.sub(A);
+        e1.crossVectors(B, A).normalize();
+        e2.crossVectors(B, e1).normalize();
+        const rad = 0.07 * A.length() * (1 - 0.4 * sP);
+        const ph = cap[c + 5] + sP * 32;
+        A.addScaledVector(e1, Math.cos(ph) * rad).addScaledVector(e2, Math.sin(ph) * rad);
+        const b = smooth(0, 0.2, sP);
+        p[ix] = lerp(W.cp[ix], A.x, b);
+        p[ix + 1] = lerp(W.cp[ix + 1], A.y, b);
+        p[ix + 2] = lerp(W.cp[ix + 2], A.z, b);
+        continue;
+      }
+      const inCme = preImpact && p[ix] < frontX;
+      const speed = inCme ? 12 : ambSpeed;
+      p[ix] += v[ix] * speed * dt;
+      p[ix + 1] += v[ix + 1] * speed * dt;
+      p[ix + 2] += v[ix + 2] * speed * dt;
+      // deflect around the magnetopause
+      tmp.set(p[ix], p[ix + 1], p[ix + 2]);
+      const d = tmp.length();
+      const cosTh = -tmp.x / d;
+      if (cosTh > -0.55 && d < 30) {
+        const th = Math.acos(cosTh);
+        const R = r0 * Math.pow(2 / (1 + Math.cos(th)), alpha) * 1.1;
+        if (d < R) {
+          nrm.copy(tmp).divideScalar(d);
+          tmp.copy(nrm).multiplyScalar(R);
+          p[ix] = tmp.x;
+          p[ix + 1] = tmp.y;
+          p[ix + 2] = tmp.z;
+          if (Math.random() < capRate * dt) {
+            this.capture(i, r0, alpha);
+            continue;
+          }
+          let vx = v[ix], vy = v[ix + 1], vz = v[ix + 2];
+          const vn = vx * nrm.x + vy * nrm.y + vz * nrm.z;
+          if (vn < 0) {
+            vx -= vn * nrm.x;
+            vy -= vn * nrm.y;
+            vz -= vn * nrm.z;
+          }
+          const yz = Math.hypot(nrm.y, nrm.z) || 1;
+          vx += 0.25;
+          vy += (nrm.y / yz) * 0.4;
+          vz += (nrm.z / yz) * 0.4;
+          const mm = Math.hypot(vx, vy, vz);
+          v[ix] = vx / mm;
+          v[ix + 1] = vy / mm;
+          v[ix + 2] = vz / mm;
+        }
+      } else if (p[ix] > 0) {
+        // relax back to anti-sunward flow downstream
+        v[ix] = lerp(v[ix], 1, 0.02);
+        const mm = Math.hypot(v[ix], v[ix + 1], v[ix + 2]);
+        v[ix] /= mm;
+        v[ix + 1] /= mm;
+        v[ix + 2] /= mm;
+      }
+      if (p[ix] > 34 || Math.abs(p[ix + 1]) > 30 || Math.abs(p[ix + 2]) > 30) this.park(i);
+    }
+  }
+
+  updateWind(st, r0, alpha) {
+    const W = this.wind;
+    const inten = this.windIntensity(st);
+    // Motion runs on the story clock: frozen when paused, capped so 20x stays readable.
+    const dh = Math.abs(st.dh ?? 0);
+    if (!this.windWarm || dh > 0.5) {
+      // first frame or a jump on the timeline: refill the flow for the new moment
+      for (let i = 0; i < W.n; i++) this.park(i);
+      W.clock = 0;
+      for (let k = 0; k < 170; k++) this.stepWind(st, r0, alpha, 0.06, inten);
+      this.windWarm = true;
+    } else {
+      this.stepWind(st, r0, alpha, clamp(dh / (st.rate || 1), 0, 0.06), inten);
+    }
+
+    const { n, p, r, cap } = W;
+    const cols = this.windPts.geometry.attributes.color.array;
+    const sizes = this.windPts.geometry.attributes.aSize.array;
+    const o = st.obs;
+    const frontX = this.cmeX ?? -100;
+    const preImpact = st.h < st.impactH;
+    const dim = lerp(1, 0.3, this.closeK ?? 0);
+    const boost = 1 + 0.6 * inten;
+    const cAmb = COL.wind.clone().lerp(COL.windSouth, smooth(-2, -20, o.bz));
+    const cCme = COL.cme.clone().lerp(COL.windSouth, 0.35);
+    const cHot = new THREE.Color("#fff1c4");
+    const c = new THREE.Color();
+    this.windMat.uniforms.uBoost.value = inten;
+    for (let i = 0; i < n; i++) {
+      const ix = i * 3;
+      const m = W.mode[i];
+      let b = 0;
+      if (m === 1) {
+        const inCme = preImpact && p[ix] < frontX;
+        c.copy(inCme ? cCme : cAmb);
+        b = (inCme ? 0.9 : 0.6 + 0.25 * r[i]) * dim * boost;
+        sizes[i] = 0.8 + 0.5 * r[i];
+      } else if (m === 2) {
+        const sP = cap[i * 8 + 3];
+        c.copy(cAmb).lerp(cHot, smooth(0.3, 1, sP));
+        b = 0.9 + 0.6 * sP;
+        sizes[i] = 1.5 + 0.6 * r[i] - 0.5 * sP;
+      }
+      cols[ix] = Math.min(1, c.r * b);
+      cols[ix + 1] = Math.min(1, c.g * b);
+      cols[ix + 2] = Math.min(1, c.b * b);
+    }
+    this.windPts.geometry.attributes.position.needsUpdate = true;
+    this.windPts.geometry.attributes.color.needsUpdate = true;
+    this.windPts.geometry.attributes.aSize.needsUpdate = true;
   }
 
   buildCme() {
@@ -464,7 +697,7 @@ export class StormScene {
   buildSites() {
     this.sites = [];
     this.siteGroup = new THREE.Group();
-    this.earth.add(this.siteGroup);
+    this.globe.add(this.siteGroup);
   }
 
   setSites(sites) {
@@ -494,26 +727,6 @@ export class StormScene {
       this.siteGroup.add(g);
       this.sites.push({ s, g, mat, halo, haloMat, el, normal, world: new THREE.Vector3(), status: "off" });
     }
-    this.raySites = this.sites.filter((x) => x.s.kind === "disaster");
-    this.rayCount = this.navic.length * this.raySites.length;
-    this.allocRays();
-  }
-
-  buildRays() {
-    this.raySegs = 14;
-  }
-
-  allocRays() {
-    const verts = this.rayCount * this.raySegs * 2;
-    const g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(verts * 3), 3));
-    g.setAttribute("color", new THREE.BufferAttribute(new Float32Array(verts * 3), 3));
-    this.rays = new THREE.LineSegments(
-      g,
-      new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false })
-    );
-    this.rays.frustumCulled = false;
-    this.scene.add(this.rays);
   }
 
   bindPointer() {
@@ -579,17 +792,12 @@ export class StormScene {
 
     // Shields
     const { r0, alpha } = st.mp;
-    this.setShell(this.magnetopause, r0, alpha, 2.15);
-    const breach = r0 < GEO_R;
-    this.magnetopause.material.uniforms.uColor.value.copy(COL.shield).lerp(COL.shieldBreach, breach ? 1 : smooth(8, 6.6, r0));
-    this.magnetopause.material.uniforms.uOpacity.value = breach ? 0.22 : 0.14;
 
     this.updateField(st, r0, alpha, t);
-    this.updateWind(st, r0, alpha, dt);
+    this.updateWind(st, r0, alpha);
     this.updateCme(st, r0, t);
     this.updateSatellites(st, t);
     this.updateSites(st, t);
-    this.updateRays(st, t);
     this.updateCamera(st, dt);
 
     // Site labels: rescue zones from chapter 2, receivers only when they are the focus. Markers grow with distance.
@@ -616,40 +824,46 @@ export class StormScene {
     this.labels.render(this.scene, this.camera);
   }
 
+  // Point u (0 = north foot, 1 = south foot) on the dipole line (L, meridian psi), squeezed on
+  // the day side by the magnetopause and stretched into a tail on the night side.
+  fieldPoint(psi, L, u, r0, alpha, storm, out) {
+    const dx = Math.cos(psi);
+    const dz = Math.sin(psi);
+    const sunward = -dx; // +1 noon, -1 midnight
+    const thMp = Math.acos(clamp(sunward, -1, 1));
+    const R = r0 * Math.pow(2 / (1 + Math.cos(Math.min(thMp, 2.2))), alpha);
+    const k = Math.min(1, (0.9 * R) / L);
+    const night = Math.max(0, -sunward);
+    const stretch = 1 + (0.35 + 2.4 * storm) * night * Math.pow(L / 8, 1.3);
+    const squash = 1 / (1 + (0.25 + 1.2 * storm) * night * (L / 8));
+    const thMin = Math.asin(Math.sqrt(1 / L));
+    const th = lerp(thMin, Math.PI - thMin, u);
+    const s = Math.sin(th);
+    const r = L * s * s;
+    let hor = r * s;
+    let y = r * Math.cos(th);
+    hor *= lerp(1, k, s * s);
+    hor *= lerp(1, stretch, Math.pow(s, 4));
+    y *= lerp(1, squash, s * s);
+    return out.set(dx * hor, y, dz * hor);
+  }
+
   updateField(st, r0, alpha, t) {
     const storm = st.storm;
     const tmp = new THREE.Color();
+    const v = new THREE.Vector3();
     const fieldCol = COL.field.clone().lerp(COL.fieldStorm, smooth(0.15, 0.8, storm));
     for (const fl of this.fieldLines) {
-      const { psi, L, N, line, seed } = fl;
-      const dx = Math.cos(psi);
-      const dz = Math.sin(psi);
-      const sunward = -dx; // +1 noon, -1 midnight
-      // magnetopause distance in this meridian's equatorial direction
-      const thMp = Math.acos(clamp(sunward, -1, 1));
-      const R = r0 * Math.pow(2 / (1 + Math.cos(Math.min(thMp, 2.2))), alpha);
-      const k = Math.min(1, (0.9 * R) / L);
-      const night = Math.max(0, -sunward);
-      const stretch = 1 + (0.35 + 2.4 * storm) * night * Math.pow(L / 8, 1.3);
-      const squash = 1 / (1 + (0.25 + 1.2 * storm) * night * (L / 8));
-      const thMin = Math.asin(Math.sqrt(1 / L));
+      const { psi, L, N, line } = fl;
       const pos = line.geometry.attributes.position.array;
       const col = line.geometry.attributes.color.array;
-      const fade = L > 9 ? 0.55 : 1;
+      const fade = (L > 9 ? 0.55 : 1) * lerp(1, 0.45, this.closeK ?? 0);
       for (let i = 0; i < N; i++) {
         const u = i / (N - 1);
-        const th = lerp(thMin, Math.PI - thMin, u);
-        const s = Math.sin(th);
-        const r = L * s * s;
-        let hor = r * s;
-        let y = r * Math.cos(th);
-        const eq = Math.pow(s, 4);
-        hor *= lerp(1, k, s * s);
-        hor *= lerp(1, stretch, eq);
-        y *= lerp(1, squash, s * s);
-        pos[i * 3] = dx * hor;
-        pos[i * 3 + 1] = y;
-        pos[i * 3 + 2] = dz * hor;
+        this.fieldPoint(psi, L, u, r0, alpha, storm, v);
+        pos[i * 3] = v.x;
+        pos[i * 3 + 1] = v.y;
+        pos[i * 3 + 2] = v.z;
         const ends = smooth(0, 0.08, u) * smooth(1, 0.92, u);
         const b = 0.22 * ends * fade * (0.85 + storm * 0.3);
         tmp.copy(fieldCol).multiplyScalar(b);
@@ -674,7 +888,7 @@ export class StormScene {
     this.cme.position.set(x - this.cmeR, 0, 0);
     const before = st.h <= st.impactH;
     const op = before ? 0.12 : 0.12 * (1 - clamp((st.h - st.impactH) / 0.9));
-    this.cmeMat.uniforms.uOpacity.value = st.chapter === 1 ? op : 0;
+    this.cmeMat.uniforms.uOpacity.value = op;
     this.cmeMat.uniforms.uTime.value = t;
     this.cmeX = x;
     // L1 detection ping
@@ -683,76 +897,6 @@ export class StormScene {
     this.l1Ping.material.opacity = 0;
     this.l1Ping.scale.setScalar(1 + (1 - ping) * 4);
     this.l1.rotation.x = t * 0.2;
-  }
-
-  updateWind(st, r0, alpha, dt) {
-    const { n, p, v, r } = this.wind;
-    const cols = this.windPts.geometry.attributes.color.array;
-    const o = st.obs;
-    const frontX = this.cmeX ?? -100;
-    const preImpact = st.h < st.impactH;
-    this.windDim = st.chapter === 1 ? 1 : st.zoom ? 0.12 : 0.3;
-    const cAmb = COL.wind.clone().lerp(COL.windSouth, smooth(-2, -20, o.bz));
-    const cCme = COL.cme.clone().lerp(COL.windSouth, 0.35);
-    const ambFrac = clamp(o.proton_density / 25, 0.35, 1);
-    const ambSpeed = (o.sw_speed / 400) * 7;
-    const tmp = new THREE.Vector3();
-    const nrm = new THREE.Vector3();
-    for (let i = 0; i < n; i++) {
-      const ix = i * 3;
-      const inCme = preImpact && p[ix] < frontX;
-      const speed = inCme ? 12 : ambSpeed;
-      const visible = r[i] < (inCme ? 1 : ambFrac);
-      // integrate
-      p[ix] += v[ix] * speed * dt;
-      p[ix + 1] += v[ix + 1] * speed * dt;
-      p[ix + 2] += v[ix + 2] * speed * dt;
-      // deflect around the magnetopause
-      tmp.set(p[ix], p[ix + 1], p[ix + 2]);
-      const d = tmp.length();
-      const cosTh = -tmp.x / d;
-      if (cosTh > -0.55 && d < 30) {
-        const th = Math.acos(cosTh);
-        const R = r0 * Math.pow(2 / (1 + Math.cos(th)), alpha) * 1.1;
-        if (d < R) {
-          nrm.copy(tmp).divideScalar(d);
-          tmp.copy(nrm).multiplyScalar(R);
-          p[ix] = tmp.x;
-          p[ix + 1] = tmp.y;
-          p[ix + 2] = tmp.z;
-          let vx = v[ix], vy = v[ix + 1], vz = v[ix + 2];
-          const vn = vx * nrm.x + vy * nrm.y + vz * nrm.z;
-          if (vn < 0) {
-            vx -= vn * nrm.x;
-            vy -= vn * nrm.y;
-            vz -= vn * nrm.z;
-          }
-          const yz = Math.hypot(nrm.y, nrm.z) || 1;
-          vx += 0.25;
-          vy += (nrm.y / yz) * 0.4;
-          vz += (nrm.z / yz) * 0.4;
-          const m = Math.hypot(vx, vy, vz);
-          v[ix] = vx / m;
-          v[ix + 1] = vy / m;
-          v[ix + 2] = vz / m;
-        }
-      } else if (p[ix] > 0) {
-        // relax back to anti-sunward flow downstream
-        v[ix] = lerp(v[ix], 1, 0.02);
-        const m = Math.hypot(v[ix], v[ix + 1], v[ix + 2]);
-        v[ix] /= m;
-        v[ix + 1] /= m;
-        v[ix + 2] /= m;
-      }
-      if (p[ix] > 34 || Math.abs(p[ix + 1]) > 30 || Math.abs(p[ix + 2]) > 30) this.spawn(i);
-      const c = inCme ? cCme : cAmb;
-      const b = visible ? (inCme ? 0.9 : 0.75) * this.windDim : 0;
-      cols[ix] = c.r * b;
-      cols[ix + 1] = c.g * b;
-      cols[ix + 2] = c.b * b;
-    }
-    this.windPts.geometry.attributes.position.needsUpdate = true;
-    this.windPts.geometry.attributes.color.needsUpdate = true;
   }
 
   updateSatellites(st, t) {
@@ -777,6 +921,7 @@ export class StormScene {
       const z = Math.sin(a) * GPS_R * Math.cos(inc);
       g.mesh.position.set(x * Math.cos(g.raan) - z * Math.sin(g.raan), y, x * Math.sin(g.raan) + z * Math.cos(g.raan));
       g.mesh.lookAt(0, 0, 0);
+      g.mesh.visible = g.mesh.position.distanceTo(this.camera.position) > 2.2;
     }
   }
 
@@ -796,94 +941,86 @@ export class StormScene {
     }
   }
 
-  updateRays(st, t) {
-    if (!this.rays) return;
-    const pos = this.rays.geometry.attributes.position.array;
-    const col = this.rays.geometry.attributes.color.array;
-    const S = this.raySegs;
-    const a = new THREE.Vector3();
-    const b = new THREE.Vector3();
-    const perp = new THREE.Vector3();
-    const perp2 = new THREE.Vector3();
-    const c = new THREE.Color();
-    const sig = COL.signal;
-    const degr = clamp(st.truthError / 70); // 0 calm .. 1 badly degraded
-    let k = 0;
-    let rid = 0;
-    const show = 1;
-    for (const sat of this.navic) {
-      for (const site of this.raySites) {
-        rid++;
-        const visible = site.world.clone().sub(sat.world).dot(site.world) < 0; // site sees the satellite
-        const statusCol = new THREE.Color(STATUS_HEX[site.status === "off" ? "off" : site.status]);
-        const focus = st.focusSite && st.focusSite === site.s.id;
-        const flick = 1;
-        const base = (visible ? 1 : 0) * show * (st.focusSite ? (focus ? 0.9 : 0.06) : 0.5) * flick;
-        a.copy(sat.world);
-        b.copy(site.world);
-        const dir = b.clone().sub(a).normalize();
-        perp.crossVectors(dir, new THREE.Vector3(0, 1, 0)).normalize();
-        perp2.crossVectors(dir, perp).normalize();
-        for (let i = 0; i < S; i++) {
-          for (let e = 0; e < 2; e++) {
-            const u = (i + e) / S;
-            const p = a.clone().lerp(b, u);
-            const w = smooth(0.55, 0.92, u) * (1 - smooth(0.985, 1, u));
-            const amp = degr * 0.035 * w;
-            p.addScaledVector(perp, noise1(t * 9 + rid * 7 + u * 25) * amp);
-            p.addScaledVector(perp2, noise1(t * 8 + rid * 5 + u * 31 + 50) * amp);
-            pos[k * 3] = p.x;
-            pos[k * 3 + 1] = p.y;
-            pos[k * 3 + 2] = p.z;
-            const toward = smooth(0.5, 1, u);
-            const target = site.status === "off" ? sig : statusCol;
-            c.copy(sig).lerp(target, toward);
-            const travel = 1;
-            const v = base * travel * 0.35;
-            col[k * 3] = c.r * v;
-            col[k * 3 + 1] = c.g * v;
-            col[k * 3 + 2] = c.b * v;
-            k++;
-          }
-        }
-      }
-    }
-    this.rays.geometry.attributes.position.needsUpdate = true;
-    this.rays.geometry.attributes.color.needsUpdate = true;
-  }
-
   // ---------- camera ----------
+  // A shot is { target, dir (unit, from target to camera), dist }. Shots blend on a sphere around
+  // the target (direction slerp + log distance), so a zoom never cuts through Earth.
   shotFor(st) {
     const indiaW = llv(INDIA.lat, INDIA.lon, 1).applyQuaternion(this.earth.quaternion).normalize();
+    // Follow India with a rate limit: at 20x Earth turns ~100 deg/s and the view would spin.
+    // A jump on the timeline resets the tracked direction; the camera smoothing still glides there.
+    if (!this.indiaDir || st.snap || Math.abs(st.dh ?? 0) > 0.25) this.indiaDir = indiaW.clone();
+    else rotateToward(this.indiaDir, indiaW, (Math.PI / 180) * 12 * Math.min(st.dt, 0.05));
+    const india = this.indiaDir;
     const north = new THREE.Vector3(0, 1, 0);
-    const side = new THREE.Vector3().crossVectors(north, indiaW).normalize();
+    const side = new THREE.Vector3().crossVectors(north, india).normalize();
     const track = (dist, lift, swing, lookK) => {
-      const dir = indiaW.clone().addScaledVector(north, lift).addScaledVector(side, swing).normalize();
-      return { pos: dir.multiplyScalar(dist), target: indiaW.clone().multiplyScalar(lookK) };
+      const target = india.clone().multiplyScalar(lookK * EARTH_R);
+      const pos = india.clone().addScaledVector(north, lift).addScaledVector(side, swing).normalize().multiplyScalar(dist);
+      return toShot(pos, target);
     };
-    if (st.chapter === 1) {
-      const push = smooth(st.impactH - 1.2, st.impactH + 1.5, st.h);
-      return {
-        pos: new THREE.Vector3(lerp(-20, -4, push), lerp(11, 5, push), lerp(58, 21, push)),
-        target: new THREE.Vector3(lerp(-19, -3.5, push), -1, 0),
-      };
-    }
-    if (st.chapter === 2) return track(19, 0.42, 0.18, 0);
-    return track(4.6, 0.3, -0.12, 0.85);
+    const push = smooth(st.impactH - 1.2, st.impactH + 1.5, st.h);
+    const wide = toShot(
+      new THREE.Vector3(lerp(-20, -4, push), lerp(11, 5, push), lerp(58, 21, push)),
+      new THREE.Vector3(lerp(-19, -3.5, push), -1, 0)
+    );
+    // Blend across each chapter boundary so the camera is a function of story time.
+    const [, s2, s3] = st.segs;
+    const w1 = smooth(s2.from - 0.6, s2.from + 1.6, st.h);
+    const w2 = smooth(s3.from - 0.6, s3.from + 1.6, st.h);
+    this.closeK = Math.max(0.4 * w1, w2);
+    const mid = track(19, 0.42, 0.18, 0);
+    const close = track(4.6, 0.3, -0.12, 0.85);
+    return blendShot(blendShot(wide, mid, w1), close, w2);
   }
 
   updateCamera(st, dt) {
     const shot = this.shotFor(st);
-    const off = shot.pos.clone().sub(shot.target);
+    // presenter nudges, applied around the shot's target
     const up = new THREE.Vector3(0, 1, 0);
-    off.applyAxisAngle(up, this.user.yaw);
-    const right = new THREE.Vector3().crossVectors(up, off).normalize();
-    off.applyAxisAngle(right, this.user.pitch);
-    off.multiplyScalar(this.user.zoom);
-    const desired = shot.target.clone().add(off);
-    const k = 1 - Math.exp(-dt * (st.snap ? 60 : 2.2));
-    this.camera.position.lerp(desired, k);
-    this.camTarget.lerp(shot.target, k);
-    this.camera.lookAt(this.camTarget);
+    const dir = shot.dir.clone().applyAxisAngle(up, this.user.yaw);
+    const right = new THREE.Vector3().crossVectors(up, dir).normalize();
+    dir.applyAxisAngle(right, this.user.pitch).normalize();
+    const dist = shot.dist * this.user.zoom;
+
+    if (!this.cam || st.snap) {
+      this.cam = { target: shot.target.clone(), dir: dir.clone(), logDist: Math.log(dist) };
+    } else {
+      const k = 1 - Math.exp(-Math.min(dt, 0.05) * 3);
+      this.cam.target.lerp(shot.target, k);
+      rotateToward(this.cam.dir, dir, Math.acos(clamp(this.cam.dir.dot(dir), -1, 1)) * k);
+      this.cam.logDist = lerp(this.cam.logDist, Math.log(dist), k);
+    }
+    this.camera.position.copy(this.cam.dir).multiplyScalar(Math.exp(this.cam.logDist)).add(this.cam.target);
+    this.camera.lookAt(this.cam.target);
   }
+}
+
+function toShot(pos, target) {
+  const off = pos.clone().sub(target);
+  const dist = off.length();
+  return { target, dir: off.divideScalar(dist), dist };
+}
+
+function blendShot(a, b, w) {
+  if (w <= 0) return a;
+  if (w >= 1) return b;
+  const dir = a.dir.clone();
+  rotateToward(dir, b.dir, Math.acos(clamp(a.dir.dot(b.dir), -1, 1)) * w);
+  return {
+    target: a.target.clone().lerp(b.target, w),
+    dir,
+    dist: Math.exp(lerp(Math.log(a.dist), Math.log(b.dist), w)),
+  };
+}
+
+// Rotate unit vector v toward unit vector to by at most maxAngle (radians), in place.
+const _q = new THREE.Quaternion();
+const _axis = new THREE.Vector3();
+function rotateToward(v, to, maxAngle) {
+  const ang = Math.acos(clamp(v.dot(to), -1, 1));
+  if (ang < 1e-5 || maxAngle <= 0) return v;
+  _axis.crossVectors(v, to);
+  if (_axis.lengthSq() < 1e-10) _axis.set(0, 1, 0).cross(v);
+  _axis.normalize();
+  return v.applyQuaternion(_q.setFromAxisAngle(_axis, Math.min(ang, maxAngle))).normalize();
 }

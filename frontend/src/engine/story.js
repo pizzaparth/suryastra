@@ -30,19 +30,25 @@ export const CHAPTERS = [
   { n: 3, title: "From error forecast to alert" },
 ];
 
-// Chapter segments come from the scenario's computed results.
+// Chapter segments: three back-to-back ranges of one continuous timeline, so the playhead
+// only ever moves forward during playback.
+//   1. start -> shock has passed Earth (impact + 2 h)
+//   2. -> Dst minimum (main phase), at least 4 h long
+//   3. -> end of the replay
 export function segments() {
   const r = S.results;
   const end = H_END();
-  const imp = IMPACT_H();
-  const ch2From = Math.max(0, (r.first_forecast_storm_issued_h ?? imp) - 1);
-  const ch2To = Math.min(end - 4, Math.max(r.min_dst_obs_h, ch2From + 5));
+  const b1 = Math.min(IMPACT_H() + 2, end - 8);
+  const b2 = Math.min(end - 4, Math.max(r.min_dst_obs_h, b1 + 4));
   return [
-    { chapter: 1, from: 0, to: imp + 3, secs: 24 },
-    { chapter: 2, from: ch2From, to: ch2To, secs: 30 },
-    { chapter: 3, from: ch2To, to: end, secs: 30 },
+    { chapter: 1, from: 0, to: b1 },
+    { chapter: 2, from: b1, to: b2 },
+    { chapter: 3, from: b2, to: end },
   ];
 }
+
+// Story hours per real second at 1x: the whole replay takes about 85 s.
+export const RATE_1X = () => H_END() / 85;
 
 export const timeAt = (h) => new Date(T0 + h * 36e5);
 const lerp = (a, b, t) => a + (b - a) * t;
@@ -96,19 +102,31 @@ export function magnetopause(p, bz) {
 }
 
 // ---------- playback ----------
+// One clock (h) drives everything: the scene, the panel and the timeline bar.
 export class Playback {
   constructor() {
-    this.seg = 0;
     this.h = 0;
     this.playing = false;
     this.speed = 1;
     this.listeners = new Set();
+    this._chapter = 1;
   }
   get segs() {
     return segments();
   }
+  get seg() {
+    return this.segs.findIndex((s) => s.chapter === this._chapter);
+  }
+  set seg(i) {
+    this._chapter = this.segs[i]?.chapter ?? 1;
+  }
   get chapter() {
-    return this.segs[this.seg].chapter;
+    return this._chapter;
+  }
+  chapterAt(h) {
+    const segs = this.segs;
+    for (let i = segs.length - 1; i >= 0; i--) if (h >= segs[i].from) return segs[i].chapter;
+    return 1;
   }
   on(fn) {
     this.listeners.add(fn);
@@ -126,43 +144,35 @@ export class Playback {
     }
   }
   toggle() {
-    const segs = this.segs;
-    if (!this.playing && this.seg === segs.length - 1 && this.h >= segs[this.seg].to) this.goChapter(1);
+    if (!this.playing && this.h >= H_END()) this.scrub(0);
     this.playing = !this.playing;
     this.emit("play");
   }
   goChapter(n) {
-    this.seg = this.segs.findIndex((s) => s.chapter === n);
-    this.h = this.segs[this.seg].from;
-    this.emit("chapter");
+    const s = this.segs.find((x) => x.chapter === n) ?? this.segs[0];
+    this.scrub(s.from);
   }
   scrub(h) {
-    const segs = this.segs;
-    h = Math.min(Math.max(h, 0), H_END());
-    const cur = this.chapter;
-    let idx = segs.findIndex((s) => s.chapter === cur && h >= s.from && h <= s.to);
-    if (idx < 0) idx = segs.findIndex((s) => h >= s.from && h <= s.to);
-    if (idx < 0) idx = Math.max(0, segs.map((s) => s.from <= h).lastIndexOf(true));
-    const changed = segs[idx].chapter !== cur;
-    this.seg = idx;
-    this.h = h;
-    this.emit(changed ? "chapter" : "scrub");
+    this.h = Math.min(Math.max(h, 0), H_END());
+    this.sync("scrub");
+  }
+  sync(fallback) {
+    const ch = this.chapterAt(this.h);
+    const changed = ch !== this._chapter;
+    this._chapter = ch;
+    if (changed) this.emit("chapter");
+    else if (fallback) this.emit(fallback);
   }
   tick(dt) {
     if (!this.playing) return;
-    const segs = this.segs;
-    const s = segs[this.seg];
-    this.h += ((s.to - s.from) / s.secs) * dt * this.speed;
-    if (this.h >= s.to) {
-      if (this.seg < segs.length - 1) {
-        this.seg += 1;
-        this.h = segs[this.seg].from;
-        this.emit("chapter");
-      } else {
-        this.h = s.to;
-        this.playing = false;
-        this.emit("play");
-      }
+    this.h += RATE_1X() * dt * this.speed;
+    if (this.h >= H_END()) {
+      this.h = H_END();
+      this.playing = false;
+      this.sync();
+      this.emit("play");
+      return;
     }
+    this.sync();
   }
 }

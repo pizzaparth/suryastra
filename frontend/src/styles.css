@@ -130,19 +130,27 @@ body.show-analysis .scenarios, body.show-analysis .clock { visibility: hidden; }
 .btn[aria-pressed="true"] { background: var(--ink); color: #000; }
 
 .track-area { position: relative; height: 64px; user-select: none; }
-.bands { position: absolute; left: 0; right: 0; top: 4px; height: 26px; display: flex; gap: 8px; }
+.bands { position: absolute; left: 0; right: 0; top: 4px; height: 26px; }
 .band {
-  flex: 1; height: 26px; padding: 0 8px; border: 0; border-left: 1px solid #444;
+  position: absolute; top: 0; height: 26px; padding: 0 8px; border: 0; border-left: 1px solid #444;
   background: transparent; color: var(--ink-2); font-size: 15px; text-align: left; cursor: pointer;
-  white-space: nowrap; overflow: hidden;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .band:hover { color: var(--ink); }
 .band[aria-current="true"] { color: var(--ink); font-weight: 600; border-left-color: var(--ink); }
-.track { position: absolute; left: 0; right: 0; top: 38px; height: 20px; cursor: pointer; }
-.track .rail { position: absolute; left: 0; right: 0; top: 9px; height: 2px; background: #333; }
-.track .range { position: absolute; top: 4px; height: 12px; background: #1c1c1c; }
-.track .done { position: absolute; left: 0; top: 9px; height: 2px; background: var(--ink); }
-.track .head { position: absolute; top: 2px; width: 3px; height: 16px; margin-left: -1.5px; background: var(--ink); }
+.track { position: absolute; left: 0; right: 0; top: 34px; height: 26px; cursor: pointer; }
+.track .range { position: absolute; top: 0; bottom: 0; background: #1c1c1c; border-radius: 3px; }
+.track .spark { position: absolute; left: 0; top: 0; width: 100%; height: 22px; }
+.track .spark.dim { opacity: 0.25; }
+.track .spark.lit { opacity: 0.7; }
+.track .rail { position: absolute; left: 0; right: 0; top: 22px; height: 2px; background: #333; }
+.track .done { position: absolute; left: 0; top: 22px; height: 2px; background: var(--ink); }
+.track .marks { position: absolute; inset: 0; pointer-events: none; }
+.track .mark { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; }
+.track .mark.impact { background: #ff8a24; }
+.track .mark.red { background: #fff; }
+.track .mark.peak { background: #8c8c8c; }
+.track .head { position: absolute; top: -2px; width: 4px; height: 30px; margin-left: -2px; background: #fff; border-radius: 2px; }
 
 @media (prefers-reduced-motion: reduce) { .flash { animation-duration: 0.01s; } }
 @media (max-width: 1280px) { #app { grid-template-columns: minmax(0, 1fr) 380px; } .caption h2 { font-size: 32px; } }

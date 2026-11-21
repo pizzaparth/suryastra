@@ -9,6 +9,7 @@ import {
   Playback,
   CHAPTERS,
   IMPACT_H,
+  RATE_1X,
   current,
   setScenario,
   timeAt,
@@ -41,8 +42,7 @@ function chooseScenario(id) {
   setScenario(id);
   document.querySelectorAll("[data-sc]").forEach((b) => b.setAttribute("aria-pressed", b.dataset.sc === id));
   pb.playing = false;
-  pb.seg = 0;
-  pb.h = 0;
+  pb.scrub(0);
   panel.reset();
   timeline.reset();
   scene.resetView();
@@ -74,32 +74,16 @@ $("#analysis-btn").addEventListener("click", async () => {
   $("#analysis-btn").setAttribute("aria-pressed", opening);
 });
 
-// ---------- caption and transition flash ----------
+// ---------- caption ----------
 function setCaption(n) {
   const c = CHAPTERS[n - 1];
   $("#caption").innerHTML = `<div class="num">${current().title}</div><h2>${c.n}. ${c.title}</h2>`;
 }
 
-function flash(title) {
-  const el = $("#flash");
-  el.hidden = false;
-  el.innerHTML = `<span>${title}</span>`;
-  el.style.animation = "none";
-  void el.offsetWidth;
-  el.style.animation = "";
-  clearTimeout(flash.t);
-  flash.t = setTimeout(() => (el.hidden = true), 2300);
-}
-
-let prevH = 0;
 pb.on((type, p) => {
   if (type === "chapter") {
     scene.resetView();
     setCaption(p.chapter);
-    if (p.playing && p.chapter > 1) {
-      const to = hhmm(timeAt(p.h));
-      flash(p.h < prevH ? `Rewind to ${to} UTC` : `${to} UTC`);
-    }
     panel.update(state(), true);
   }
 });
@@ -107,7 +91,8 @@ setCaption(1);
 
 // ---------- state for one frame ----------
 let snapFrames = 0;
-function state(dt = 0) {
+let prevH = 0;
+function state(dt = 0, dh = 0) {
   const h = pb.h;
   const date = timeAt(h);
   const obs = observedAt(h);
@@ -115,6 +100,10 @@ function state(dt = 0) {
   return {
     h,
     dt,
+    dh, // story hours moved this frame (0 when paused): drives particle motion
+    rate: RATE_1X(),
+    segs: pb.segs,
+    playing: pb.playing,
     date,
     chapter: pb.chapter,
     zoom: false,
@@ -123,7 +112,7 @@ function state(dt = 0) {
     storm: Math.min(1, Math.max(0, (-obs.dst - 15) / 330)),
     impactH: IMPACT_H(),
     truthError: m2Error(obs.dst, date),
-    alerts: pb.chapter > 1 ? alertsAt(h) : null,
+    alerts: alertsAt(h),
     focusSite: null,
     snap: snapFrames > 0,
   };
@@ -135,9 +124,9 @@ function frame(now) {
   const dt = (now - last) / 1000;
   last = now;
   if ($("#analysis").hidden) {
-    prevH = pb.h;
     pb.tick(dt);
-    const st = state(dt);
+    const st = state(dt, pb.h - prevH);
+    prevH = pb.h;
     if (snapFrames > 0) snapFrames--;
     scene.update(st);
     panel.update(st);
@@ -160,3 +149,4 @@ if (q.has("h")) pb.scrub(Number(q.get("h")));
 if (q.has("ch") || q.has("h")) snapFrames = 8;
 if (q.has("analysis")) $("#analysis-btn").click();
 window.__pb = pb;
+window.__scene = scene;
