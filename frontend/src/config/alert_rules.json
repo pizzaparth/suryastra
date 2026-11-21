@@ -1,0 +1,49 @@
+{
+  "_about": "Rule-based alert algorithm (plan.md). Levels are checked top to bottom; the first match wins. Edit thresholds here, then run `npm run build` (or just save while `npm run dev` is running).",
+  "metric": "navic_error_m",
+  "levels": [
+    {
+      "id": "RED",
+      "label": "Red",
+      "status": "critical",
+      "when": {
+        "all": [
+          { "metric": "navic_error_m", "op": ">", "value": 30 },
+          { "flag": "disaster_active", "equals": true }
+        ]
+      },
+      "action": "Halt NavIC-dependent rescue operations and use alternative positioning"
+    },
+    {
+      "id": "ORANGE",
+      "label": "Orange",
+      "status": "serious",
+      "when": {
+        "any": [
+          { "metric": "navic_error_m", "op": ">", "value": 15 },
+          {
+            "all": [
+              { "metric": "navic_error_m", "op": ">", "value": 10 },
+              { "flag": "disaster_active", "equals": true }
+            ]
+          }
+        ]
+      },
+      "action": "Switch to manual navigation backup"
+    },
+    {
+      "id": "YELLOW",
+      "label": "Yellow",
+      "status": "warning",
+      "when": { "metric": "navic_error_m", "op": ">", "value": 5 },
+      "action": "Use dual-frequency correction"
+    },
+    {
+      "id": "GREEN",
+      "label": "Green",
+      "status": "good",
+      "when": { "always": true },
+      "action": "Normal NavIC operations"
+    }
+  ]
+}

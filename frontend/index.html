@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Suryastra</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="top">
+        <div class="left">
+          <h1>Suryastra</h1>
+          <button class="btn" id="analysis-btn">Data analysis</button>
+        </div>
+        <div class="scenarios" id="scenarios" role="group" aria-label="Storm scenario"></div>
+        <div class="clock" id="clock"></div>
+      </header>
+
+      <main class="stage">
+        <div class="scene" id="scene"></div>
+        <div class="scene-overlay" id="labels"></div>
+        <div class="caption" id="caption"></div>
+        <div class="flash" id="flash" hidden></div>
+      </main>
+
+      <aside class="panel" id="panel" aria-label="Model results"></aside>
+
+      <footer class="timeline" id="timeline"></footer>
+
+      <section class="analysis" id="analysis" hidden aria-label="Data analysis"></section>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
